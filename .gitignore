@@ -1,0 +1,49 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data
+data/raw/*
+data/processed/*
+!data/sample_sentences.txt   # keep example file if you want
+
+# Logs and results
+results/logs/*
+results/metrics/*
+results/plots/*
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# IDE/project settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python packaging
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Environment/config files
+.env
+*.yaml
+*.yml
+config.json
+
+# Misc
+*.bak
+*.tmp
