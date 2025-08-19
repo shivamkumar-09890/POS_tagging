@@ -43,8 +43,6 @@ The assignment involves building, evaluating, and comparing three models:
     │ ├── data_loader.py # Dataset loading
     │ └── visualization.py # Plotting utilities
     │
-    ├── notebooks/ # Jupyter notebooks for experiments
-    │
     ├── results/ # Results storage
     │ ├── logs/ # Training logs
     │ ├── metrics/ # Metrics (json/csv)
