@@ -47,3 +47,8 @@ config.json
 # Misc
 *.bak
 *.tmp
+
+#infrenced models
+saved_hmm_pos/
+saved_pos_model/
+saved_rnn_pos/
