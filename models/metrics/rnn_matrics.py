@@ -80,17 +80,29 @@ def evaluate_rnn():
                         y_true.append(idx2tag[str(g)])
                         y_pred.append(idx2tag[str(p)])
 
-    # 🔹 Compute metrics
+    # 🔹 Compute overall metrics
     acc = accuracy_score(y_true, y_pred)
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average="weighted"
     )
+
+    # 🔹 Compute per-tag accuracy
+    per_tag_acc = {}
+    labels = list(idx2tag.values())
+    for label in labels:
+        indices = [i for i, t in enumerate(y_true) if t == label]
+        if indices:
+            correct = sum(1 for i in indices if y_true[i] == y_pred[i])
+            per_tag_acc[label] = correct / len(indices)
+        else:
+            per_tag_acc[label] = None  # tag not present in test set
 
     results = {
         "accuracy": acc,
         "precision": precision,
         "recall": recall,
         "f1_score": f1,
+        "per_tag_accuracy": per_tag_acc,
         "classification_report": classification_report(y_true, y_pred, output_dict=True),
     }
 
@@ -99,8 +111,10 @@ def evaluate_rnn():
         json.dump(results, f, indent=4)
 
     print(f"✅ RNN metrics saved to {OUT_PATH}")
-    labels = list(idx2tag.values())
+
+    # 🔹 Plot confusion matrix
     plot_confusion_matrix(y_true, y_pred, labels=labels)
+
 
 if __name__ == "__main__":
     evaluate_rnn()

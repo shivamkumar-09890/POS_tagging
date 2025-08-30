@@ -39,7 +39,6 @@ def plot_confusion_matrix(y_true, y_pred, labels, save_path= "/home/shivam/cs772
     else:
         plt.show()
 
-
 def evaluate_hmm():
     # Load processed data
     (_, _), (_, _), (X_test, y_test), word2idx, tag2idx, idx2word, idx2tag = load_processed_data()
@@ -60,17 +59,29 @@ def evaluate_hmm():
         y_true.extend(gold_tags)
         y_pred.extend(pred_tags)
 
-    # Compute metrics
+    # Compute overall metrics
     acc = accuracy_score(y_true, y_pred)
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average="weighted"
     )
+
+    # Compute per-tag accuracy
+    per_tag_acc = {}
+    labels = list(idx2tag.values())
+    for label in labels:
+        indices = [i for i, t in enumerate(y_true) if t == label]
+        if indices:
+            correct = sum(1 for i in indices if y_true[i] == y_pred[i])
+            per_tag_acc[label] = correct / len(indices)
+        else:
+            per_tag_acc[label] = None  # in case tag not present in test set
 
     results = {
         "accuracy": acc,
         "precision": precision,
         "recall": recall,
         "f1_score": f1,
+        "per_tag_accuracy": per_tag_acc,
         "classification_report": classification_report(y_true, y_pred, output_dict=True),
     }
 
@@ -79,8 +90,6 @@ def evaluate_hmm():
         json.dump(results, f, indent=4)
 
     print(f"✅ HMM metrics saved to {OUT_PATH}")
-
-    labels = list(idx2tag.values())  # all possible tags
 
     plot_confusion_matrix(y_true, y_pred, labels=labels)
 
