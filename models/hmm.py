@@ -1,23 +1,15 @@
-# hmm_pos_tagger.py
 import os
 import json
-import nltk
-from nltk.corpus import brown
 from collections import defaultdict, Counter
 from typing import List
+from models.utils.dataLoder import load_processed_data
 
-# ------------------------------
-# Config
-# ------------------------------
-MODEL_DIR = "saved_hmm_pos"
+MODEL_FILE = "saved_hmm_pos"
+BASE_DIR = "/home/shivam/cs772/Assignment1"
+MODEL_DIR = os.path.join(BASE_DIR,"models",MODEL_FILE)
 os.makedirs(MODEL_DIR, exist_ok=True)
+PROCESSED_DIR = os.path.join(BASE_DIR,"data", "processed")
 
-nltk.download("brown", quiet=True)
-nltk.download("universal_tagset", quiet=True)
-
-# ------------------------------
-# HMM POS Tagger Class
-# ------------------------------
 class HMMPOSTagger:
     def __init__(self):
         self.tags = set()
@@ -60,9 +52,6 @@ class HMMPOSTagger:
             self.emission_probs[tag] = {w: c / total for w, c in self.emission_probs[tag].items()}
         print("Training complete.")
 
-    # ------------------------------
-    # Viterbi algorithm for inference
-    # ------------------------------
     def predict(self, words: List[str]) -> List[str]:
         words = [w.lower() for w in words]
         T = len(words)
@@ -92,10 +81,8 @@ class HMMPOSTagger:
                         best_prev = prev_tag
                 viterbi[t][tag] = max_prob
                 backpointer[t][tag] = best_prev
-        
-        # termination
+
         best_path = []
-        # find best last tag
         last_tag = max(viterbi[T-1], key=viterbi[T-1].get)
         best_path.append(last_tag)
         for t in range(T-1, 0, -1):
@@ -104,9 +91,6 @@ class HMMPOSTagger:
         best_path.reverse()
         return best_path
 
-    # ------------------------------
-    # Save / Load model
-    # ------------------------------
     def save(self, path=MODEL_DIR):
         data = {
             "tags": list(self.tags),
@@ -133,26 +117,26 @@ class HMMPOSTagger:
                                            {k: defaultdict(float, v) for k, v in data["emission_probs"].items()})
         return model
 
-# ------------------------------
-# Example usage
-# ------------------------------
 if __name__ == "__main__":
-    # load Brown corpus
-    tagged_sents = brown.tagged_sents(tagset="universal")
-    
-    # split train/test
-    from sklearn.model_selection import train_test_split
-    train_sents, test_sents = train_test_split(tagged_sents, test_size=0.2, random_state=42)
-    
-    # train HMM
+
+    (X_train, y_train), (X_val, y_val), (X_test, y_test), word2idx, tag2idx, idx2word, idx2tag = load_processed_data()
+
+    train_sents = [
+        [(idx2word[str(w)], idx2tag[str(t)]) for w, t in zip(words, tags) if w != 0]  # skip PAD
+        for words, tags in zip(X_train, y_train)
+    ]
+    test_sents = [
+        [(idx2word[str(w)], idx2tag[str(t)]) for w, t in zip(words, tags) if w != 0]
+        for words, tags in zip(X_test, y_test)
+    ]
+
     hmm = HMMPOSTagger()
     hmm.train(train_sents)
     hmm.save()
-    
-    # load saved model
+
+    # Load saved model
     hmm2 = HMMPOSTagger.load()
-    
-    # demo inference
+
     sentence = "The quick brown fox jumps over the lazy dog .".split()
     tags = hmm2.predict(sentence)
     for w, t in zip(sentence, tags):

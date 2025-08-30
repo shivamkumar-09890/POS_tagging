@@ -1,26 +1,13 @@
 # rnn_pos_tagger.py
 import os
 import json
-import random
-import pickle
 from typing import List, Tuple, Dict
-
-import nltk
-from nltk.corpus import brown
-from sklearn.model_selection import train_test_split
-
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from models.utils.dataLoder import load_processed_data
 
-# -----------------------------
-# Config / Hyperparameters
-# -----------------------------
-nltk.download("brown", quiet=True)
-nltk.download("universal_tagset", quiet=True)
-
-MODEL_DIR = "saved_rnn_pos"
+MODEL_DIR = "models/saved_rnn_pos"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 EMBED_DIM = 128
@@ -37,9 +24,6 @@ TAG_PAD = -100      # ignore index for loss
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# -----------------------------
-# Helpers: build vocab, encode
-# -----------------------------
 def build_vocab(sentences: List[List[Tuple[str, str]]]):
     words = set()
     tags = set()
@@ -57,26 +41,19 @@ def build_vocab(sentences: List[List[Tuple[str, str]]]):
     idx2tag = {i: t for t, i in tag2idx.items()}
     return word2idx, tag2idx, idx2word, idx2tag
 
-def encode_sentence(sent: List[Tuple[str, str]], word2idx: Dict[str,int], tag2idx: Dict[str,int]):
-    words = [w.lower() for w, _ in sent]
-    tags = [t for _, t in sent]
-    x = [word2idx.get(w, word2idx[UNK_TOKEN]) for w in words]
-    y = [tag2idx[t] for t in tags]
-    return x, y
+class IndexedPOSDataset(Dataset):
+    """Dataset for already indexed sequences (X, y)."""
+    def __init__(self, X, y):
+        self.X = X
+        self.y = y
 
-# -----------------------------
-# Dataset + collate_fn
-# -----------------------------
-class POSDataset(Dataset):
-    def __init__(self, tagged_sents: List[List[Tuple[str,str]]], word2idx, tag2idx):
-        self.data = [encode_sentence(s, word2idx, tag2idx) for s in tagged_sents]
     def __len__(self):
-        return len(self.data)
+        return len(self.X)
+
     def __getitem__(self, idx):
-        return self.data[idx]   # (x_list, y_list)
+        return self.X[idx], self.y[idx]
 
 def collate_batch(batch):
-    # batch: list of (x, y) where x,y are lists
     xs, ys = zip(*batch)
     lengths = [len(x) for x in xs]
     max_len = max(lengths)
@@ -84,41 +61,105 @@ def collate_batch(batch):
     padded_y = []
     for x, y in zip(xs, ys):
         pad_len = max_len - len(x)
-        padded_x.append(x + [0]*pad_len)  # PAD index = 0
-        padded_y.append(y + [TAG_PAD]*pad_len)  # label ignore pad
+        padded_x.append(x + [0]*pad_len)
+        padded_y.append(y + [TAG_PAD]*pad_len)
     return (torch.tensor(padded_x, dtype=torch.long),
             torch.tensor(padded_y, dtype=torch.long),
             torch.tensor(lengths, dtype=torch.long))
 
-# -----------------------------
-# Model: Embedding + BiLSTM + Linear
-# -----------------------------
-class BiLSTMTagger(nn.Module):
-    def __init__(self, vocab_size, tagset_size, embed_dim=EMBED_DIM, hidden_dim=HIDDEN_DIM,
-                 num_layers=NUM_LAYERS, bidirectional=BIDIRECTIONAL, dropout=0.3):
+class LSTMCell(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.lstm = nn.LSTM(embed_dim,
-                            hidden_dim,
-                            num_layers=num_layers,
-                            bidirectional=bidirectional,
-                            batch_first=True,
-                            dropout=dropout if num_layers>1 else 0.0)
-        lstm_out_dim = hidden_dim * (2 if bidirectional else 1)
-        self.fc = nn.Linear(lstm_out_dim, tagset_size)
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+
+        # Combine all gates into one big linear transform for efficiency
+        self.x2h = nn.Linear(input_dim, 4 * hidden_dim)
+        self.h2h = nn.Linear(hidden_dim, 4 * hidden_dim)
+
+    def forward(self, x_t, h_prev, c_prev):
+        # x_t: (batch, input_dim)
+        # h_prev, c_prev: (batch, hidden_dim)
+        gates = self.x2h(x_t) + self.h2h(h_prev)
+        i, f, g, o = gates.chunk(4, dim=-1)
+
+        i = torch.sigmoid(i)          # input gate
+        f = torch.sigmoid(f)          # forget gate
+        g = torch.tanh(g)             # candidate cell
+        o = torch.sigmoid(o)          # output gate
+
+        c_t = f * c_prev + i * g
+        h_t = o * torch.tanh(c_t)
+        return h_t, c_t
+
+class LSTMLayer(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.cell = LSTMCell(input_dim, hidden_dim)
 
     def forward(self, x, lengths):
-        # x: (batch, seq_len)
-        emb = self.embedding(x)  # (batch, seq_len, emb)
-        packed = pack_padded_sequence(emb, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        packed_out, _ = self.lstm(packed)
-        out, _ = pad_packed_sequence(packed_out, batch_first=True)  # (batch, seq_len, hidden*dirs)
-        logits = self.fc(out)  # (batch, seq_len, tagset)
+        # x: (batch, seq_len, input_dim)
+        batch_size, seq_len, _ = x.size()
+        h = torch.zeros(batch_size, self.cell.hidden_dim, device=x.device)
+        c = torch.zeros(batch_size, self.cell.hidden_dim, device=x.device)
+
+        outputs = []
+        for t in range(seq_len):
+            h, c = self.cell(x[:, t, :], h, c)
+            outputs.append(h.unsqueeze(1))
+        outputs = torch.cat(outputs, dim=1)  # (batch, seq_len, hidden_dim)
+        return outputs
+
+class BiLSTMTagger(nn.Module):
+    def __init__(self, vocab_size, tagset_size,
+                 embed_dim=EMBED_DIM, hidden_dim=HIDDEN_DIM,
+                 num_layers=NUM_LAYERS, bidirectional=True, dropout=0.3):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.hidden_dim = hidden_dim
+
+        # Forward layers
+        self.layers_fwd = nn.ModuleList([
+            LSTMLayer(embed_dim if i == 0 else hidden_dim, hidden_dim)
+            for i in range(num_layers)
+        ])
+
+        if bidirectional:
+            # Backward layers
+            self.layers_bwd = nn.ModuleList([
+                LSTMLayer(embed_dim if i == 0 else hidden_dim, hidden_dim)
+                for i in range(num_layers)
+            ])
+
+        lstm_out_dim = hidden_dim * (2 if bidirectional else 1)
+        self.fc = nn.Linear(lstm_out_dim, tagset_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, lengths):
+        emb = self.embedding(x)  # (batch, seq_len, embed_dim)
+
+        out_fwd = emb
+        for layer in self.layers_fwd:
+            out_fwd = layer(out_fwd, lengths)
+
+        if self.bidirectional:
+            # Run backward
+            rev_emb = torch.flip(emb, dims=[1])
+            out_bwd = rev_emb
+            for layer in self.layers_bwd:
+                out_bwd = layer(out_bwd, lengths)
+            out_bwd = torch.flip(out_bwd, dims=[1])
+            out = torch.cat([out_fwd, out_bwd], dim=-1)
+        else:
+            out = out_fwd
+
+        out = self.dropout(out)
+        logits = self.fc(out)   # (batch, seq_len, tagset_size)
         return logits
 
-# -----------------------------
-# Training / Evaluation loops
-# -----------------------------
+
 def train_epoch(model, dataloader, optimizer, criterion):
     model.train()
     total_loss = 0.0
@@ -127,8 +168,7 @@ def train_epoch(model, dataloader, optimizer, criterion):
         y_batch = y_batch.to(DEVICE)
         lengths = lengths.to(DEVICE)
         optimizer.zero_grad()
-        logits = model(x_batch, lengths)  # (B, L, C)
-        # reshape for loss: (B*L, C) and targets (B*L)
+        logits = model(x_batch, lengths)
         B, L, C = logits.shape
         logits_flat = logits.view(B*L, C)
         targets_flat = y_batch.view(B*L)
@@ -156,9 +196,6 @@ def evaluate(model, dataloader, idx2tag):
     acc = correct / total if total else 0.0
     return acc
 
-# -----------------------------
-# Save / Load utilities
-# -----------------------------
 def save_checkpoint(model, word2idx, tag2idx, idx2word, idx2tag, path=MODEL_DIR):
     torch.save(model.state_dict(), os.path.join(path, "model.pt"))
     with open(os.path.join(path, "word2idx.json"), "w") as f:
@@ -182,35 +219,25 @@ def load_vocabs(path=MODEL_DIR):
     # keys in JSON are strings — convert tag2idx values to int keys already are fine
     return word2idx, tag2idx, idx2word, idx2tag
 
-# -----------------------------
-# Main pipeline
-# -----------------------------
 def main():
-    # load dataset
-    tagged = list(brown.tagged_sents(tagset="universal"))
-    # optionally shuffle then split
-    random.seed(42)
-    random.shuffle(tagged)
-    train_sents, test_sents = train_test_split(tagged, test_size=0.2, random_state=42)
-    train_sents, val_sents = train_test_split(train_sents, test_size=0.1, random_state=42)
+    # 🔹 Load processed data
+    (X_train, y_train), (X_val, y_val), (X_test, y_test), word2idx, tag2idx, idx2word, idx2tag = load_processed_data()
 
-    print(f"Train: {len(train_sents)}, Val: {len(val_sents)}, Test: {len(test_sents)}")
-
-    word2idx, tag2idx, idx2word, idx2tag = build_vocab(train_sents)
     vocab_size = len(word2idx)
     tagset_size = len(tag2idx)
-
     print("Vocab size:", vocab_size, "Tagset size:", tagset_size)
+    print(f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
 
-    train_ds = POSDataset(train_sents, word2idx, tag2idx)
-    val_ds = POSDataset(val_sents, word2idx, tag2idx)
-    test_ds = POSDataset(test_sents, word2idx, tag2idx)
+    # Wrap in Dataset objects
+    train_ds = IndexedPOSDataset(X_train, y_train)
+    val_ds = IndexedPOSDataset(X_val, y_val)
+    test_ds = IndexedPOSDataset(X_test, y_test)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_batch)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_batch)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_batch)
 
-    # model, optimizer, criterion
+    # Model, optimizer, criterion
     model = BiLSTMTagger(vocab_size=vocab_size, tagset_size=tagset_size).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     criterion = nn.CrossEntropyLoss(ignore_index=TAG_PAD)
@@ -220,34 +247,36 @@ def main():
         train_loss = train_epoch(model, train_loader, optimizer, criterion)
         val_acc = evaluate(model, val_loader, idx2tag)
         print(f"Epoch {epoch:2d} | Train loss: {train_loss:.4f} | Val acc: {val_acc:.4f}")
-        # save best model
+
+        # Save best checkpoint
         if val_acc > best_val:
             best_val = val_acc
-            save_checkpoint(model, word2idx, tag2idx, idx2word, idx2tag)
-            print(f"  Saved best model (val acc {best_val:.4f})")
+            torch.save(model.state_dict(), os.path.join(MODEL_DIR, "model.pt"))
+            print(f"  ✅ Saved best model (val acc {best_val:.4f})")
 
-    # final test
+    # Final test
     print("Loading best model for test evaluation...")
-    # load weights
     model.load_state_dict(torch.load(os.path.join(MODEL_DIR, "model.pt"), map_location=DEVICE))
     test_acc = evaluate(model, test_loader, idx2tag)
     print(f"Test token-level accuracy: {test_acc:.4f}")
 
-    # demo inference on a single sentence
+    # Demo inference
     demo = "The quick brown fox jumps over the lazy dog .".split()
-    # encode demo
-    word2idx_local, tag2idx_local, idx2word_local, idx2tag_local = word2idx, tag2idx, idx2word, idx2tag
-    x_demo = [word2idx_local.get(w.lower(), word2idx_local[UNK_TOKEN]) for w in demo]
+    x_demo = [word2idx.get(w.lower(), word2idx[UNK_TOKEN]) for w in demo]
     lengths_demo = torch.tensor([len(x_demo)], dtype=torch.long)
     x_demo_tensor = torch.tensor([x_demo], dtype=torch.long).to(DEVICE)
+
     model.eval()
     with torch.no_grad():
         logits = model(x_demo_tensor, lengths_demo.to(DEVICE))
         preds = logits.argmax(dim=-1).squeeze(0).cpu().tolist()
+
     print("\nDemo tagging:")
     for tok, p in zip(demo, preds):
-        print(f"{tok:12} -> {idx2tag_local[str(p)] if isinstance(list(idx2tag_local.keys())[0], str) else idx2tag_local[p] }")
-    # note: idx2tag loaded from build_vocab uses int keys; saved idx2tag JSON keys are strings if reloaded.
+        # idx2tag JSON has str keys
+        tag = idx2tag[str(p)] if str(p) in idx2tag else idx2tag[p]
+        print(f"{tok:12} -> {tag}")
+
 
 if __name__ == "__main__":
     main()
